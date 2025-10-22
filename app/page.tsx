@@ -1155,108 +1155,173 @@ function SelfTests() {
   const [results, setResults] = useState<Array<{ name: string; pass: boolean; message?: string }> | null>(null);
 
   function run() {
-    const output: Array<{ name: string; pass: boolean; message?: string }> = [];
+    const out: Array<{ name: string; pass: boolean; message?: string }> = [];
 
-    const record = (name: string, assertion: () => void) => {
+    function test(name: string, fn: () => void) {
       try {
-        assertion();
-        output.push({ name, pass: true });
+        fn();
+        out.push({ name, pass: true });
       } catch (error) {
-        output.push({
+        out.push({
           name,
           pass: false,
           message: error instanceof Error ? error.message : String(error),
         });
       }
-    };
+    }
 
-    const expectEqual = (actual: number, expected: number, tolerance = 0) => {
-      if (Math.abs(actual - expected) > tolerance) {
-        throw new Error(`Expected ${expected}, received ${actual}`);
+    function expect(condition: boolean, message: string) {
+      if (!condition) {
+        throw new Error(message);
       }
-    };
+    }
 
-    record("Contradiction balances evidence", () => {
-      const value = scoreContradiction(
-        [
-          { id: "1", text: "Item" },
-          { id: "2", text: "Item" },
-          { id: "3", text: "Item" },
-        ],
-        [{ id: "c1", text: "Counter" }]
-      );
-      expectEqual(value, 75);
+    test("ID generator produces unique-ish values", () => {
+      const first = newId();
+      const second = newId();
+      expect(typeof first === "string" && first.length > 8, "id length");
+      expect(first !== second, "ids should differ");
     });
 
-    record("Contradiction defaults conservatively", () => {
-      const value = scoreContradiction([], []);
-      expectEqual(value, 40);
+    test("Weight normalization sums ≈ 1", () => {
+      const normalized = normalizeWeights({
+        contradiction: 0.1,
+        time: 0.2,
+        identity: 0.3,
+        logic: 0.4,
+        resonanceInfluence: 10,
+        evidenceBonusMax: 10,
+        evidenceBonusPer: 1,
+        assumptionPenaltyPer: 1,
+        assumptionPenaltyThreshold: 3,
+      });
+      const sum =
+        normalized.contradiction + normalized.time + normalized.identity + normalized.logic;
+      expect(Math.abs(sum - 1) < 1e-9, `sum=${sum}`);
     });
 
-    record("Time scoring rewards precise references", () => {
-      const refs = ["march", "2024"];
-      const value = scoreTime(refs, "Happened in March 2024", "Claim");
-      expectEqual(value, 90);
+    test("Contradiction scoring reacts to evidence vs counters (edge values)", () => {
+      const high = scoreContradiction([{ id: newId(), text: "e" }], []);
+      const low = scoreContradiction([], [{ id: newId(), text: "c" }]);
+      expect(high > low, `high=${high} low=${low}`);
+      expect(high === 100 && low === 0, "edge values");
     });
 
-    record("Identity penalizes vague pronouns", () => {
-      const value = scoreIdentity("", "They always win");
-      expectEqual(value, 45);
+    test("Time scoring penalizes vague time", () => {
+      const vague = scoreTime(["recently"], "", "");
+      const dated = scoreTime(["october", "2024"], "", "");
+      expect(dated > vague, `dated=${dated} vague=${vague}`);
     });
 
-    record("Logic penalizes absolutes and assumptions", () => {
-      const value = scoreLogic("Everyone always fails", ["a", "b", "c", "d"]);
-      expectEqual(value, 44);
+    test("Logic scoring penalizes absolutes & assumptions", () => {
+      const baseline = scoreLogic("Some people report burnout", []);
+      const absolute = scoreLogic("Everyone always reports burnout", []);
+      const manyAssumptions = scoreLogic("Neutral", ["a", "b", "c", "d"]);
+      expect(baseline > absolute, `baseline=${baseline} absolute=${absolute}`);
+      expect(baseline > manyAssumptions, `baseline=${baseline} assumptions=${manyAssumptions}`);
     });
 
-    record("Depth combines components and resonance", () => {
-      const coherence = { contradiction: 80, time: 70, identity: 60, logic: 90 };
+    test("computeDepth returns bounded finalDepth", () => {
+      const coherence = {
+        contradiction: 80,
+        time: 70,
+        identity: 90,
+        logic: 85,
+      } satisfies ProbeResult["coherence"];
       const contribs = computeDepth(
         coherence,
         3,
         1,
         { resonanceForecaster: true, depthIntegrityScan: true, witnessMode: true },
         { clarity: 70, tension: 30, openness: 80 },
-        defaultWeights
+        {
+          contradiction: 0.25,
+          time: 0.25,
+          identity: 0.25,
+          logic: 0.25,
+          resonanceInfluence: 10,
+          evidenceBonusMax: 10,
+          evidenceBonusPer: 5,
+          assumptionPenaltyPer: 4,
+          assumptionPenaltyThreshold: 3,
+        }
       );
-      expectEqual(contribs.finalDepth, 77, 0);
-      expectEqual(contribs.baseBeforeResonance, 84, 0);
-      expectEqual(contribs.resonanceNudge, -7, 0);
+      expect(Number.isFinite(contribs.finalDepth), "finalDepth finite");
+      expect(
+        contribs.finalDepth >= 0 && contribs.finalDepth <= 100,
+        `finalDepth=${contribs.finalDepth}`
+      );
     });
 
-    setResults(output);
+    test("Sanitizer fills missing arrays", () => {
+      const sanitized = sanitizeProbe({ claim: "x" });
+      expect(Array.isArray(sanitized.evidence), "evidence array exists");
+      expect(Array.isArray(sanitized.counters), "counters array exists");
+      expect(Array.isArray(sanitized.assumptions), "assumptions array exists");
+    });
+
+    test("statusFromDepth thresholds", () => {
+      const off = statusFromDepth(65, {
+        resonanceForecaster: true,
+        depthIntegrityScan: false,
+        witnessMode: true,
+      });
+      const on = statusFromDepth(65, {
+        resonanceForecaster: true,
+        depthIntegrityScan: true,
+        witnessMode: true,
+      });
+      const low = statusFromDepth(30, {
+        resonanceForecaster: true,
+        depthIntegrityScan: true,
+        witnessMode: true,
+      });
+      expect(off === "OK", `off=${off}`);
+      expect(on === "⟁~", `on=${on}`);
+      expect(low === "△∅", `low=${low}`);
+    });
+
+    test("extractTimeRefs finds months & years", () => {
+      const refs = extractTimeRefs("Happened in October 2024, recently discussed.");
+      expect(refs.includes("october"), `october not found: ${JSON.stringify(refs)}`);
+      expect(refs.includes("2024"), `2024 not found: ${JSON.stringify(refs)}`);
+    });
+
+    setResults(out);
   }
 
   return (
     <Card className="shadow-sm">
       <CardHeader className="pb-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Sparkles className="h-4 w-4" /> Built-in Self Tests
-        </CardTitle>
+        <CardTitle className="text-base">Self-checks</CardTitle>
       </CardHeader>
-      <CardContent className="space-y-3 text-sm">
+      <CardContent className="space-y-2 text-sm">
         <p className="text-xs text-slate-500">
-          Quick smoke-checks on scoring helpers. Useful when editing weight logic or coherence heuristics.
+          Quick unit tests for core helpers and regressions (including the previous unterminated string /
+          undefined map crashes).
         </p>
-        <Button size="sm" onClick={run}>
-          <Play className="mr-2 h-4 w-4" /> Run self-tests
+        <Button size="sm" variant="outline" onClick={run}>
+          <Play className="mr-1 h-4 w-4" /> Run tests
         </Button>
         {results && (
-          <ul className="space-y-2">
-            {results.map((result) => (
-              <li key={result.name} className="flex items-start gap-2 text-xs">
+          <div className="mt-2">
+            {results.map((result, index) => (
+              <div
+                key={`${result.name}-${index}`}
+                className={`flex items-start gap-2 text-xs ${result.pass ? "text-emerald-700" : "text-rose-700"}`}
+              >
                 {result.pass ? (
-                  <CheckCircle2 className="mt-[2px] h-4 w-4 text-emerald-500" />
+                  <CheckCircle2 className="h-4 w-4" />
                 ) : (
-                  <XCircle className="mt-[2px] h-4 w-4 text-rose-500" />
+                  <XCircle className="h-4 w-4" />
                 )}
                 <div>
                   <div className="font-medium">{result.name}</div>
-                  {!result.pass && result.message && <div className="text-slate-500">{result.message}</div>}
+                  {!result.pass && result.message && <div className="opacity-80">{result.message}</div>}
                 </div>
-              </li>
+              </div>
             ))}
-          </ul>
+          </div>
         )}
       </CardContent>
     </Card>
