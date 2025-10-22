@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -98,8 +98,8 @@ const LS_WEIGHTS = "ref-truth-engine-weights";
 function newId(): string {
   try {
     if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  } catch (error) {
-    console.error("UUID generation failed, using fallback", error);
+  } catch {
+    // noop – fall back to Math.random below
   }
   const rand = Math.random().toString(36).slice(2, 10);
   return `id-${Date.now().toString(36)}-${rand}`;
@@ -358,55 +358,67 @@ const starterProbe: Probe = {
 
 export default function Component() {
   const [rawProbes, setRawProbes] = useLocalStorage<any>(LS_KEY, []);
-  const probes: Probe[] = (Array.isArray(rawProbes) ? rawProbes : []).map(sanitizeProbe);
+  const probes = useMemo(
+    () => (Array.isArray(rawProbes) ? rawProbes : []).map(sanitizeProbe),
+    [rawProbes]
+  );
   const [weights, setWeights] = useLocalStorage<Weights>(LS_WEIGHTS, defaultWeights);
   const [autoRecalc, setAutoRecalc] = useState(false);
   const [activeId, setActiveId] = useState<string>(probes[0]?.id || "");
 
   useEffect(() => {
     if (!Array.isArray(rawProbes) || rawProbes.length === 0) {
-      const seed = [starterProbe];
-      setRawProbes(seed);
+      setRawProbes([starterProbe]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [rawProbes, setRawProbes]);
 
   const active = useMemo(() => probes.find((probe) => probe.id === activeId) || probes[0], [probes, activeId]);
   useEffect(() => {
     if (!active && probes[0]) setActiveId(probes[0].id);
   }, [active, probes]);
 
-  function writeProbes(next: Probe[]) {
-    setRawProbes(next);
-  }
+  const writeProbes = useCallback(
+    (updater: Probe[] | ((prev: Probe[]) => Probe[])) => {
+      setRawProbes((previous: Probe[]) => {
+        const sanitizedPrev = (Array.isArray(previous) ? previous : []).map(sanitizeProbe);
+        const nextValue =
+          typeof updater === "function"
+            ? (updater as (prev: Probe[]) => Probe[])(sanitizedPrev)
+            : updater;
+        return Array.isArray(nextValue) ? nextValue.map(sanitizeProbe) : sanitizedPrev;
+      });
+    },
+    [setRawProbes]
+  );
 
-  function updateActive(partial: Partial<Probe>) {
+  const updateActive = useCallback(
+    (partial: Partial<Probe>) => {
+      if (!active) return;
+      writeProbes((prev) =>
+        prev.map((probe) => (probe.id === active.id ? { ...probe, ...partial } : probe))
+      );
+    },
+    [active, writeProbes]
+  );
+
+  const addEvidence = useCallback(() => {
     if (!active) return;
-    const next = probes.map((probe) => (probe.id === active.id ? { ...probe, ...partial } : probe));
-    writeProbes(next);
-  }
+    updateActive({
+      evidence: [...ensureArray(active.evidence), { id: newId(), text: "", source: "" }],
+    });
+  }, [active, updateActive]);
 
-  useEffect(() => {
-    if (autoRecalc && active) runScan();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [weights]);
-
-  function addEvidence() {
-    if (!active) return;
-    updateActive({ evidence: [...ensureArray(active.evidence), { id: newId(), text: "", source: "" }] });
-  }
-
-  function addCounter() {
+  const addCounter = useCallback(() => {
     if (!active) return;
     updateActive({ counters: [...ensureArray(active.counters), { id: newId(), text: "" }] });
-  }
+  }, [active, updateActive]);
 
-  function addAssumption() {
+  const addAssumption = useCallback(() => {
     if (!active) return;
     updateActive({ assumptions: [...ensureArray(active.assumptions), ""] });
-  }
+  }, [active, updateActive]);
 
-  function runScan() {
+  const runScan = useCallback(() => {
     if (!active) return;
     const timeRefs = Array.from(
       new Set([...extractTimeRefs(active.claim), ...extractTimeRefs(active.context)])
@@ -471,8 +483,10 @@ export default function Component() {
 
     const rigorLevel = active.stakes < 34 ? "Light" : active.stakes < 67 ? "Medium" : "High";
     const guidance: string[] = [];
-    if (rigorLevel === "Light") guidance.push("2+ concrete pieces of evidence, 1 counterexample, date at least month+year.");
-    if (rigorLevel === "Medium") guidance.push("3–5 sources (mix personal + external), explicit dates, run 1 falsification test.");
+    if (rigorLevel === "Light")
+      guidance.push("2+ concrete pieces of evidence, 1 counterexample, date at least month+year.");
+    if (rigorLevel === "Medium")
+      guidance.push("3–5 sources (mix personal + external), explicit dates, run 1 falsification test.");
     if (rigorLevel === "High")
       guidance.push(
         "5+ sources incl. base rates, opposing sources, precise dating, pre-register what would change your mind."
@@ -493,16 +507,22 @@ export default function Component() {
           absolutes,
           vaguePronouns,
           timeRefs,
-          hasExplicitMonth: timeRefs.some((token) => monthWords().includes((token || "").toLowerCase())),
+          hasExplicitMonth: timeRefs.some((token) =>
+            monthWords().includes((token || "").toLowerCase())
+          ),
           hasYear: /\b(19|20)\d{2}\b/.test(`${active.context || ""} ${active.claim || ""}`),
         },
         rigor: { level: rigorLevel as ProbeResult["rigor"]["level"], guidance },
         status,
       },
     });
-  }
+  }, [active, updateActive, weights]);
 
-  function newProbe() {
+  useEffect(() => {
+    if (autoRecalc) runScan();
+  }, [autoRecalc, runScan]);
+
+  const newProbe = useCallback(() => {
     const probe: Probe = {
       id: newId(),
       createdAt: new Date().toISOString(),
@@ -518,25 +538,27 @@ export default function Component() {
       toggles: { resonanceForecaster: true, depthIntegrityScan: true, witnessMode: true },
       loops: [],
     };
-    const next = [probe, ...probes];
-    writeProbes(next);
+    writeProbes((prev) => [probe, ...prev]);
     setActiveId(probe.id);
-  }
+  }, [setActiveId, writeProbes]);
 
-  function cloneAsLoop() {
+  const cloneAsLoop = useCallback(() => {
     if (!active) return;
     const refined: Probe = { ...active, id: newId(), createdAt: new Date().toISOString(), loops: [] };
-    const next = probes.map((probe) =>
-      probe.id === active.id ? { ...probe, loops: [refined, ...ensureArray(probe.loops)] } : probe
+    writeProbes((prev) =>
+      prev.map((probe) =>
+        probe.id === active.id
+          ? { ...probe, loops: [refined, ...ensureArray(probe.loops)] }
+          : probe
+      )
     );
-    writeProbes(next);
-  }
+  }, [active, writeProbes]);
 
-  function exportJSON() {
+  const exportJSON = useCallback(() => {
     if (!active) return;
     const payload = JSON.stringify(active, null, 2);
     download(`ref-truth-probe-${active.id}.json`, payload);
-  }
+  }, [active]);
 
   function saveTitleFromClaim(claim: string) {
     if (!claim) return "Untitled";
